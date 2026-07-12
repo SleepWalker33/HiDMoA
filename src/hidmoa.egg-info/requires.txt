@@ -1,0 +1,13 @@
+numpy
+pillow
+matplotlib
+scikit-learn
+torch
+torchvision
+
+[dev]
+pytest
+ruff
+
+[search]
+optuna

@@ -1,0 +1,4 @@
+[console_scripts]
+hidmoa = hidmoa.cli:main
+hidmoa-check-data = hidmoa.check_data:main
+hidmoa-prepare-folders = hidmoa.prepare_class_folders:main

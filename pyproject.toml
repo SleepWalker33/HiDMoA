@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hidmoa"
+version = "0.1.0"
+description = "HiDMoA for class-incremental defect classification."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+  {name = "HiDMoA Authors"}
+]
+dependencies = [
+  "numpy",
+  "pillow",
+  "matplotlib",
+  "scikit-learn",
+  "torch",
+  "torchvision",
+]
+
+[project.optional-dependencies]
+search = ["optuna"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+hidmoa = "hidmoa.cli:main"
+hidmoa-check-data = "hidmoa.check_data:main"
+hidmoa-prepare-folders = "hidmoa.prepare_class_folders:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
