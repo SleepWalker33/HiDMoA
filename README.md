@@ -443,6 +443,9 @@ HIDMOA_FVAE_GENERATED_PER_CLASS*    generated/replayed feature count per class
 HIDMOA_FVAE_FEATURE_BATCH           feature extraction batch size
 HIDMOA_ROUTER_IMPORTANCE_SAMPLES*   router scoring sample count
 CIL_PROFILE_FLOPS                   1 to profile FLOPs, 0 to skip
+train.taskid_image_size*             task-router / task-id branch input size
+train.vae_router_backbone_image_size* router feature-extractor input size
+train.vae.image_size                  input size for optional `vae` router backend
 train.fvae.lr*                      feature-VAE learning rate
 train.fvae.weight_decay*            feature-VAE weight decay
 train.fvae.h_dim*                   feature-VAE hidden dimension
