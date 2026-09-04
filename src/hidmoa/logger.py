@@ -29,6 +29,7 @@ def profile_subdir(profile: str, seed: int, multi_seed: bool) -> str:
 
 _REPORT_SECTION_PROFILE = {
     "incremental_2": "HiDMoA",
+    "incremental_3": "HiDMoA",
     "HiDMoA": "HiDMoA",
 }
 
