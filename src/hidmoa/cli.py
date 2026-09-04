@@ -24,15 +24,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-mode",
         default="hidmoa",
-        choices=["hidmoa", "incremental_2"],
-        help="Public alias for the HiDMoA method.",
+        choices=["hidmoa", "incremental_3"],
+        help="Public alias for the HiDMoA incre3 method.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    os.environ["RUN_MODE"] = "hidmoa" if args.run_mode == "hidmoa" else "incremental_2"
+    os.environ["RUN_MODE"] = "hidmoa" if args.run_mode == "hidmoa" else "incremental_3"
     if args.dataset:
         os.environ["CIL_ACTIVE_DATASET"] = args.dataset
     if args.seed is not None:
