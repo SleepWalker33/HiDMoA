@@ -710,24 +710,79 @@ class MoEBlock(nn.Module):
         self.task_gates = nn.ModuleDict()    # str(task_id) → Linear(C, num_experts)
         self.task_old_gates = nn.ModuleDict()  # str(task_id) → Linear(C, visible_old_experts)
         self.task_old_refs: Dict[str, List[Tuple[str, int]]] = {}
+        self.task_reuse_refs: Dict[str, List[Tuple[str, int]]] = {}
 
-    def add_task(self, task_id: int, num_experts: int = 2):
+    def add_task(
+        self,
+        task_id: int,
+        num_experts: int = 2,
+        *,
+        copy_from_task_ids: Optional[List[int]] = None,
+        copy_from_expert_refs: Optional[List[Tuple[int, int]]] = None,
+        reuse_task_ids: Optional[List[int]] = None,
+        include_random_experts: bool = True,
+    ):
         key = str(task_id)
         device = None
         for module_list in self.task_experts.values():
             if len(module_list) > 0:
                 device = next(module_list.parameters()).device
                 break
-        experts = nn.ModuleList([
-            ExpertAdapter(self.channels, self.bottleneck, self.feature_ndim)
-            for _ in range(num_experts)
-        ])
-        gate = nn.Linear(self.channels, num_experts)
+        expert_items = []
+        if include_random_experts:
+            expert_items.extend(
+                ExpertAdapter(self.channels, self.bottleneck, self.feature_ndim)
+                for _ in range(num_experts)
+            )
+
+        explicit_copy_refs = list(copy_from_expert_refs or [])
+        if explicit_copy_refs:
+            for source_task_id, expert_idx in explicit_copy_refs:
+                source_key = str(int(source_task_id))
+                if source_key not in self.task_experts:
+                    raise KeyError(f"cannot copy experts from missing task {source_task_id}")
+                source_experts = self.task_experts[source_key]
+                expert_idx = int(expert_idx)
+                if expert_idx < 0 or expert_idx >= len(source_experts):
+                    raise IndexError(
+                        f"cannot copy expert {expert_idx} from task {source_task_id}; "
+                        f"available experts={len(source_experts)}"
+                    )
+                copied = ExpertAdapter(self.channels, self.bottleneck, self.feature_ndim)
+                copied.load_state_dict(source_experts[expert_idx].state_dict())
+                expert_items.append(copied)
+        else:
+            for source_task_id in copy_from_task_ids or []:
+                source_key = str(int(source_task_id))
+                if source_key not in self.task_experts:
+                    raise KeyError(f"cannot copy experts from missing task {source_task_id}")
+                source_experts = self.task_experts[source_key]
+                copy_count = min(int(num_experts), len(source_experts))
+                for old_expert in source_experts[:copy_count]:
+                    copied = ExpertAdapter(self.channels, self.bottleneck, self.feature_ndim)
+                    copied.load_state_dict(old_expert.state_dict())
+                    expert_items.append(copied)
+
+        reuse_refs: List[Tuple[str, int]] = []
+        for source_task_id in reuse_task_ids or []:
+            source_key = str(int(source_task_id))
+            if source_key not in self.task_experts:
+                raise KeyError(f"cannot reuse experts from missing task {source_task_id}")
+            for expert_idx in range(len(self.task_experts[source_key])):
+                reuse_refs.append((source_key, expert_idx))
+
+        if not expert_items and not reuse_refs:
+            raise ValueError("add_task requires at least one random/copied/reused expert")
+
+        experts = nn.ModuleList(expert_items)
+        gate = nn.Linear(self.channels, len(expert_items) + len(reuse_refs))
         if device is not None:
             experts = experts.to(device)
             gate = gate.to(device)
         self.task_experts[key] = experts
         self.task_gates[key] = gate
+        if reuse_refs:
+            self.task_reuse_refs[key] = reuse_refs
         if self.allow_old_expert_reuse and int(task_id) > 0:
             visible_old_refs: List[Tuple[str, int]] = []
             for old_key in sorted(self.task_experts.keys(), key=int):
@@ -766,7 +821,7 @@ class MoEBlock(nn.Module):
 
         # Gate: CNN uses GAP; ViT/DeiT token features use the class token.
         g = self._gate_inputs(x)                              # [B, C]
-        w = F.softmax(gate(g), dim=1)                     # [B, num_experts]
+        w = F.softmax(gate(g), dim=1)                     # [B, num_experts + selected old experts]
 
         # 加权融合所有专家输出
         out = torch.zeros_like(x)
@@ -776,6 +831,16 @@ class MoEBlock(nn.Module):
             else:
                 weight = w[:, i].view(-1, 1, 1)
             out = out + weight * expert(x)
+
+        new_expert_count = len(experts)
+        for old_offset, (old_task_key, old_expert_idx) in enumerate(self.task_reuse_refs.get(key, [])):
+            expert_weight = w[:, new_expert_count + old_offset]
+            old_expert = self.task_experts[old_task_key][old_expert_idx]
+            if x.dim() == 4:
+                weight = expert_weight.view(-1, 1, 1, 1)
+            else:
+                weight = expert_weight.view(-1, 1, 1)
+            out = out + weight * old_expert(x)
 
         old_sparse_w = None
         if self.allow_old_expert_reuse and key in self.task_old_gates and self.task_old_refs.get(key):
@@ -884,11 +949,27 @@ class IncrementalMoEResNet(nn.Module):
             self._freeze_backbone_bn_stats()
 
     # ---------- 任务管理 ----------
-    def add_task(self, task_id: int, num_experts: ExpertCountSpec = 2):
+    def add_task(
+        self,
+        task_id: int,
+        num_experts: ExpertCountSpec = 2,
+        *,
+        copy_from_task_ids: Optional[List[int]] = None,
+        copy_from_expert_refs: Optional[List[Tuple[int, int]]] = None,
+        reuse_task_ids: Optional[List[int]] = None,
+        include_random_experts: bool = True,
+    ):
         device = next(self.backbone_modules[0].parameters()).device
         per_layer_counts = normalize_moe_expert_counts(num_experts, self.moe_layer_names)
         for name in self.moe_layer_names:
-            self.moe_blocks[name].add_task(task_id, per_layer_counts[name])
+            self.moe_blocks[name].add_task(
+                task_id,
+                per_layer_counts[name],
+                copy_from_task_ids=copy_from_task_ids,
+                copy_from_expert_refs=copy_from_expert_refs,
+                reuse_task_ids=reuse_task_ids,
+                include_random_experts=include_random_experts,
+            )
             self.moe_blocks[name].to(device)
 
     def freeze_task(self, task_id: int):
