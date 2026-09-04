@@ -2143,7 +2143,7 @@ def _search_incremental_2_task_router_alpha(
         best_loss = float(study.best_value)
         return best_alpha, best_loss
 
-    print("[incre2] optuna is not installed; using random search fallback for task_router_alpha")
+    print("[HiDMoA] optuna is not installed; using random search fallback for task_router_alpha")
     rng = random.Random(int(search_seed))
 
     class _Trial:
