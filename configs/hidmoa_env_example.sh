@@ -15,6 +15,11 @@ export HIDMOA_DEVICE=cuda
 export HIDMOA_BATCH_SIZE=32
 export CIL_NUM_WORKERS=0
 
+# Incre3 defaults to the DeiT backbone used in the research code.
+# Set these if you run the default deit_small_patch16_224_in661 configuration.
+# export CIL_TPL_REPO_DIR=/path/to/TPL
+# export CIL_MORE_PRETRAINED_PATH=/path/to/imagenet_661_pretrained.pt
+
 # Training length. For a quick smoke test, use:
 #   export HIDMOA_EPOCHS_PER_TASK=1
 #   export HIDMOA_FVAE_EPOCHS=1
@@ -24,6 +29,9 @@ export HIDMOA_EARLY_STOP_PATIENCE=5
 export HIDMOA_FVAE_EPOCHS=200
 export HIDMOA_FVAE_PATIENCE=20
 export HIDMOA_FVAE_GENERATED_PER_CLASS=600
+
+# Expert-transfer initialization.
+export HIDMOA_EXPERT_INIT_STRATEGY=new_copyold1
 
 # Disable FLOPs profiling for faster smoke tests.
 export CIL_PROFILE_FLOPS=0
