@@ -331,7 +331,7 @@ def measure_incremental1_forward_per_image(
     num_seen_tasks: int,
     oracle_taskid: bool,
 ) -> Optional[int]:
-    """Inference FLOPs for one test image at final session (incremental_2 path)."""
+    """Inference FLOPs for one test image at final session (HiDMoA/incre3 path)."""
     x = torch.randn(1, 3, image_size, image_size)
     total = 0
     last_tid = max(num_seen_tasks - 1, 0)
