@@ -6,7 +6,7 @@ import os
 import json
 import math
 from copy import deepcopy
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from deterministic import (
@@ -66,7 +66,7 @@ from .config import (
     COMMON_HEAD,
     DATA,
     EFFICIENCY,
-    INCREMENTAL_2,
+    INCREMENTAL_3,
     RUN_MODE,
     apply_internal_run_seed,
     cil_deterministic_enabled,
@@ -132,8 +132,9 @@ from .train import (
 def _normalize_run_mode(mode: str) -> str:
     mode = str(mode).strip()
     legacy_internal_aliases = {
-        "hidmoa": "incremental_2",
-        "HiDMoA": "incremental_2",
+        "hidmoa": "incremental_3",
+        "HiDMoA": "incremental_3",
+        "incremental_2": "incremental_3",
     }
     if mode in legacy_internal_aliases:
         alias = legacy_internal_aliases[mode]
@@ -448,6 +449,379 @@ def _build_generated_task_prototype(
         input_dim = int(generator_state.get("input_dim", 0))
         return torch.zeros((input_dim,), dtype=torch.float32)
     return samples.float().mean(dim=0)
+
+
+def _resolve_expert_init_preset(cfg_t: Dict) -> Dict[str, Any]:
+    strategy = str(cfg_t.get("expert_init_strategy", "new_random")).strip().lower()
+    presets = cfg_t.get("expert_init_strategy_presets", {}) or {}
+    preset = dict(presets.get(strategy, {}))
+    if not preset:
+        preset = {
+            "include_random_experts": True,
+            "random_expert_multiplier": 1,
+            "copy_top_k": int(cfg_t.get("expert_copy_top_k", 0)),
+            "reuse_top_k": int(cfg_t.get("expert_reuse_top_k", 0)),
+            "reuse_trainable": bool(cfg_t.get("expert_reuse_trainable", False)),
+        }
+    preset["strategy"] = strategy
+    preset["include_random_experts"] = bool(preset.get("include_random_experts", True))
+    preset["random_expert_multiplier"] = max(1, int(preset.get("random_expert_multiplier", 1)))
+    preset["copy_top_k"] = max(0, int(preset.get("copy_top_k", cfg_t.get("expert_copy_top_k", 0))))
+    preset["reuse_top_k"] = max(0, int(preset.get("reuse_top_k", cfg_t.get("expert_reuse_top_k", 0))))
+    preset["reuse_trainable"] = bool(preset.get("reuse_trainable", cfg_t.get("expert_reuse_trainable", False)))
+    return preset
+
+
+def _scale_expert_count_spec(num_experts: Any, multiplier: int) -> Any:
+    multiplier = max(1, int(multiplier))
+    if multiplier == 1:
+        return num_experts
+    if isinstance(num_experts, int):
+        return int(num_experts) * multiplier
+    if isinstance(num_experts, (list, tuple)):
+        return [int(v) * multiplier for v in num_experts]
+    if isinstance(num_experts, dict):
+        return {key: int(value) * multiplier for key, value in num_experts.items()}
+    raise TypeError(f"unsupported experts_per_task type: {type(num_experts).__name__}")
+
+
+@torch.no_grad()
+def _rank_old_tasks_by_fvae_recon(
+    *,
+    class_generators: Dict[int, Dict],
+    current_images: torch.Tensor,
+    feature_extractor: Optional[FrozenFeatureExtractor],
+    device: torch.device,
+    batch_size: int,
+) -> List[Dict[str, float]]:
+    if feature_extractor is None or current_images.numel() == 0:
+        return []
+    current_features = _extract_router_features(
+        feature_extractor,
+        current_images,
+        device,
+        batch_size=max(1, int(batch_size)),
+    )
+    ranked = []
+    for old_task_id, generator_state in sorted(class_generators.items(), key=lambda item: int(item[0])):
+        if str(generator_state.get("type", "")).strip().lower() != "fvae":
+            continue
+        model = generator_state.get("model")
+        if model is None:
+            continue
+        model_device = next(model.parameters()).device
+        if model_device != device:
+            model = model.to(device)
+        score = _class_vae_log_likelihood(
+            generator_state,
+            current_features.to(device),
+            eval_importance_samples=1,
+            feature_space=True,
+            score_mode="recon",
+        )
+        if model_device != device:
+            model = model.to(model_device)
+            generator_state["model"] = model
+        ranked.append({
+            "task_id": int(old_task_id),
+            "mean_recon_score": float(score.mean().item()),
+        })
+    ranked.sort(key=lambda item: item["mean_recon_score"], reverse=True)
+    return ranked
+
+
+def _aggregate_class_similarity_to_tasks(
+    ranking: List[Dict[str, float]],
+    task_splits: List[List[int]],
+    current_task_id: int,
+    aggregation: str,
+) -> List[Dict[str, Any]]:
+    score_by_class_id = {
+        int(item["task_id"]): float(item["mean_recon_score"])
+        for item in ranking
+    }
+    agg = str(aggregation).strip().lower()
+    ranked_tasks: List[Dict[str, Any]] = []
+    for old_task_id, class_ids in enumerate(task_splits[: int(current_task_id)]):
+        class_scores = []
+        for class_id in class_ids:
+            class_id = int(class_id)
+            if class_id in score_by_class_id:
+                class_scores.append((class_id, score_by_class_id[class_id]))
+        if not class_scores:
+            continue
+
+        scores = [float(score) for _class_id, score in class_scores]
+        if agg == "mean":
+            task_score = sum(scores) / float(len(scores))
+        elif agg == "sum":
+            task_score = sum(scores)
+        elif agg == "max":
+            task_score = max(scores)
+        else:
+            max_score = max(scores)
+            task_score = max_score + math.log(sum(math.exp(score - max_score) for score in scores))
+
+        ranked_tasks.append({
+            "task_id": int(old_task_id),
+            "mean_recon_score": float(task_score),
+            "class_scores": [
+                {"class_id": int(class_id), "mean_recon_score": float(score)}
+                for class_id, score in class_scores
+            ],
+        })
+    ranked_tasks.sort(key=lambda item: item["mean_recon_score"], reverse=True)
+    return ranked_tasks
+
+
+@torch.no_grad()
+def _rank_old_task_experts_by_gate(
+    *,
+    model: Optional[IncrementalMoEResNet],
+    source_task_id: int,
+    current_images: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+) -> List[Dict[str, float]]:
+    if model is None or current_images.numel() == 0:
+        return []
+    source_key = str(int(source_task_id))
+    if not getattr(model, "moe_layer_names", None):
+        return []
+    first_block = model.moe_blocks[model.moe_layer_names[0]]
+    if source_key not in first_block.task_experts:
+        return []
+    local_expert_count = len(first_block.task_experts[source_key])
+    if local_expert_count <= 0:
+        return []
+
+    was_training = model.training
+    model.eval()
+    model_device = next(model.parameters()).device
+    if model_device != device:
+        model = model.to(device)
+
+    weight_sum = torch.zeros(local_expert_count, dtype=torch.float64, device=device)
+    sample_count = 0
+    layer_count = 0
+    bs = max(1, int(batch_size))
+    for start in range(0, int(current_images.size(0)), bs):
+        imgs = current_images[start:start + bs].to(device, non_blocking=True)
+        _, gate_dict = model.forward_with_gates(imgs, int(source_task_id))
+        if sample_count == 0:
+            layer_count = len(gate_dict)
+        for layer_name in model.moe_layer_names:
+            weights = gate_dict.get(layer_name)
+            if weights is None:
+                continue
+            visible_count = min(local_expert_count, int(weights.size(1)))
+            weight_sum[:visible_count] += weights[:, :visible_count].double().sum(dim=0)
+        sample_count += int(imgs.size(0))
+
+    if model_device != device:
+        model = model.to(model_device)
+    if was_training:
+        model.train()
+
+    denom = max(1, sample_count) * max(1, layer_count)
+    means = (weight_sum / float(denom)).detach().cpu().tolist()
+    ranked = [
+        {"expert_idx": int(idx), "mean_gate_weight": float(score)}
+        for idx, score in enumerate(means)
+    ]
+    ranked.sort(key=lambda item: item["mean_gate_weight"], reverse=True)
+    return ranked
+
+
+def _build_expert_init_plan(
+    *,
+    cfg_t: Dict,
+    task_id: int,
+    model: Optional[IncrementalMoEResNet],
+    loaders: Dict,
+    class_generators: Dict[int, Dict],
+    feature_extractor: Optional[FrozenFeatureExtractor],
+    device: torch.device,
+    image_size: int,
+    feature_batch_size: int,
+    task_splits: Optional[List[List[int]]] = None,
+) -> Dict[str, Any]:
+    preset = _resolve_expert_init_preset(cfg_t)
+    plan = {
+        "strategy": preset["strategy"],
+        "include_random_experts": bool(preset["include_random_experts"]),
+        "random_expert_multiplier": int(preset["random_expert_multiplier"]),
+        "copy_from_task_ids": [],
+        "copy_from_expert_refs": [],
+        "copy_expert_ranking": [],
+        "selected_source_task_id": None,
+        "reuse_task_ids": [],
+        "similarity_ranking": [],
+    }
+    if int(task_id) <= 0:
+        plan["include_random_experts"] = True
+        return plan
+    if int(preset["copy_top_k"]) <= 0 and int(preset["reuse_top_k"]) <= 0:
+        return plan
+
+    source_key = str(cfg_t.get("expert_similarity_source", "train_eval")).strip().lower()
+    source_loader = loaders["val"] if source_key == "val" else loaders["train_eval"]
+    current_images, _ = collect_task_images(source_loader, int(image_size))
+    ranking = _rank_old_tasks_by_fvae_recon(
+        class_generators=class_generators,
+        current_images=current_images,
+        feature_extractor=feature_extractor,
+        device=device,
+        batch_size=int(feature_batch_size),
+    )
+    if (
+        str(cfg_t.get("vae_router_grouping", "class")).strip().lower() == "class"
+        and task_splits is not None
+    ):
+        ranking = _aggregate_class_similarity_to_tasks(
+            ranking,
+            task_splits,
+            int(task_id),
+            cfg_t.get("vae_router_aggregation", "logsumexp"),
+        )
+
+    ranked_task_ids = [int(item["task_id"]) for item in ranking]
+    selected_source_task_id = ranked_task_ids[0] if ranked_task_ids else None
+    copy_expert_ranking: List[Dict[str, float]] = []
+    if selected_source_task_id is not None:
+        copy_expert_ranking = _rank_old_task_experts_by_gate(
+            model=model,
+            source_task_id=int(selected_source_task_id),
+            current_images=current_images,
+            device=device,
+            batch_size=int(feature_batch_size),
+        )
+
+    copy_top_k = int(preset["copy_top_k"])
+    copy_from_task_ids: List[int] = []
+    copy_from_expert_refs: List[Tuple[int, int]] = []
+    if copy_top_k > 0 and selected_source_task_id is not None:
+        selected_expert_ids = [
+            int(item["expert_idx"])
+            for item in copy_expert_ranking[:copy_top_k]
+        ]
+        copy_from_expert_refs = [
+            (int(selected_source_task_id), expert_idx)
+            for expert_idx in selected_expert_ids
+        ]
+        if copy_from_expert_refs:
+            copy_from_task_ids = [int(selected_source_task_id)]
+
+    plan.update({
+        "copy_from_task_ids": copy_from_task_ids,
+        "copy_from_expert_refs": copy_from_expert_refs,
+        "copy_expert_ranking": copy_expert_ranking,
+        "selected_source_task_id": selected_source_task_id,
+        "reuse_task_ids": ranked_task_ids[: int(preset["reuse_top_k"])],
+        "similarity_ranking": ranking,
+    })
+    return plan
+
+
+def _task_indices_1based(task_ids: List[int]) -> List[int]:
+    return [int(tid) + 1 for tid in task_ids]
+
+
+def _format_similarity_ranking(
+    ranking: List[Dict[str, float]],
+    k: Optional[int] = None,
+) -> List[str]:
+    out = []
+    items = list(ranking or [])
+    if k is not None:
+        items = items[: max(0, int(k))]
+    for item in items:
+        task_idx = int(item.get("task_id", -1)) + 1
+        score = item.get("normalized_similarity", item.get("mean_recon_score", None))
+        if score is None:
+            out.append(str(task_idx))
+        else:
+            out.append(f"{task_idx}:{float(score):.4f}")
+    return out
+
+
+def _format_expert_refs_1based(refs: List[Tuple[int, int]]) -> List[str]:
+    out = []
+    for ref in refs or []:
+        if len(ref) < 2:
+            continue
+        task_id, expert_idx = int(ref[0]), int(ref[1])
+        out.append(f"{task_id + 1}.e{expert_idx + 1}")
+    return out
+
+
+def _format_expert_ranking(
+    source_task_id: Optional[int],
+    ranking: List[Dict[str, float]],
+    k: Optional[int] = None,
+) -> List[str]:
+    if source_task_id is None:
+        return []
+    task_idx = int(source_task_id) + 1
+    out = []
+    items = list(ranking or [])
+    if k is not None:
+        items = items[: max(0, int(k))]
+    for item in items:
+        expert_idx = int(item.get("expert_idx", -1)) + 1
+        score = item.get("mean_gate_weight", None)
+        if score is None:
+            out.append(f"{task_idx}.e{expert_idx}")
+        else:
+            out.append(f"{task_idx}.e{expert_idx}:{float(score):.4f}")
+    return out
+
+
+def _build_expert_init_report_table(expert_init_sessions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    rows = []
+    for item in expert_init_sessions:
+        task_id = int(item.get("session", 0))
+        if task_id <= 0:
+            continue
+        reuse_task_ids = [int(v) for v in item.get("reuse_task_ids", [])]
+        selected_source_task_id = item.get("selected_source_task_id", None)
+        if selected_source_task_id is not None:
+            selected_source_task_id = int(selected_source_task_id)
+        rows.append({
+            "task_index": task_id + 1,
+            "strategy": item.get("strategy", "NA"),
+            "include_random_experts": bool(item.get("include_random_experts", True)),
+            "random_expert_multiplier": int(item.get("random_expert_multiplier", 1)),
+            "task_similarity_rank_task_index:score": _format_similarity_ranking(
+                item.get("similarity_ranking", []),
+                k=None,
+            ),
+            "selected_task_index": None if selected_source_task_id is None else selected_source_task_id + 1,
+            "selected_task_expert_weights_index:weight": _format_expert_ranking(
+                selected_source_task_id,
+                item.get("copy_expert_ranking", []),
+                k=None,
+            ),
+            "copy_from_expert_refs": _format_expert_refs_1based(item.get("copy_from_expert_refs", [])),
+            "reuse_from_task_index": _task_indices_1based(reuse_task_ids),
+        })
+    if not rows:
+        return None
+    return {
+        "title": "expert_init_task_sources",
+        "columns": [
+            "task_index",
+            "strategy",
+            "include_random_experts",
+            "random_expert_multiplier",
+            "task_similarity_rank_task_index:score",
+            "selected_task_index",
+            "selected_task_expert_weights_index:weight",
+            "copy_from_expert_refs",
+            "reuse_from_task_index",
+        ],
+        "rows": rows,
+    }
 
 
 def _build_vae_router_feature_extractor(cfg_t: Dict) -> Optional[FrozenFeatureExtractor]:
@@ -1666,6 +2040,7 @@ def _run_incremental_vae_router_profile(
     val_loaders = []
     results = []
     router_sessions = []
+    expert_init_sessions: List[Dict[str, Any]] = []
     class_generators = {}
     defect_head_imprint_init = bool(COMMON_HEAD.get("imprint_init", True))
     head_type = _resolve_head_type(cfg_t)
@@ -1791,7 +2166,43 @@ def _run_incremental_vae_router_profile(
 
         if task_id > 0:
             model.freeze_task(task_id - 1)
-        model.add_task(task_id, cfg_m["experts_per_task"])
+        expert_init_plan = _build_expert_init_plan(
+            cfg_t=cfg_t,
+            task_id=task_id,
+            model=model,
+            loaders=loaders,
+            class_generators=class_generators,
+            feature_extractor=vae_router_feature_extractor,
+            device=device,
+            image_size=int(d["image_size"]),
+            feature_batch_size=int(_fvae_cfg(task_cfg_t).get("fvae_feature_batch", 64)),
+            task_splits=d["task_splits"],
+        )
+        print(
+            f"[{log_prefix_name}][session{task_id + 1}][expert-init] "
+            f"strategy={expert_init_plan['strategy']} "
+            f"random_x={int(expert_init_plan.get('random_expert_multiplier', 1))} "
+            f"selected_task={None if expert_init_plan.get('selected_source_task_id') is None else int(expert_init_plan['selected_source_task_id']) + 1} "
+            f"copy={expert_init_plan['copy_from_task_ids']} "
+            f"copy_refs={_format_expert_refs_1based(expert_init_plan.get('copy_from_expert_refs', []))} "
+            f"reuse={expert_init_plan['reuse_task_ids']}"
+        )
+        random_experts_per_task = _scale_expert_count_spec(
+            cfg_m["experts_per_task"],
+            int(expert_init_plan.get("random_expert_multiplier", 1)),
+        )
+        model.add_task(
+            task_id,
+            random_experts_per_task,
+            copy_from_task_ids=expert_init_plan["copy_from_task_ids"],
+            copy_from_expert_refs=expert_init_plan.get("copy_from_expert_refs", []),
+            reuse_task_ids=expert_init_plan["reuse_task_ids"],
+            include_random_experts=bool(expert_init_plan["include_random_experts"]),
+        )
+        expert_init_sessions.append({
+            "session": int(task_id),
+            **deepcopy(expert_init_plan),
+        })
         train_backbone_now = (
             (not bool(cfg_m.get("pretrained", True)))
             and backbone_train_first_session_if_not_pretrained
@@ -2336,6 +2747,7 @@ def _run_incremental_vae_router_profile(
             "taskid_acc": eval_result.get("taskid_acc"),
             "task_router_dual_rate": eval_result.get("task_router_dual_rate"),
             "task_router_debug": eval_result.get("task_router_debug"),
+            "expert_init": expert_init_sessions[-1] if expert_init_sessions else None,
         })
 
     cached_alpha = get_incremental_2_alpha_cache()
@@ -2543,10 +2955,15 @@ def _run_incremental_vae_router_profile(
             "task_router_alpha_search_best_val_loss": best_alpha_loss,
             "task_router_eval_grid": eval_grid_meta,
             "task_router_score_heatmaps": task_score_heatmaps,
+            "expert_init_sessions": expert_init_sessions,
         },
     )
 
     report_items = _build_incremental_session_report_items(results, d["task_splits"])
+    expert_init_table = _build_expert_init_report_table(expert_init_sessions)
+    report_section = {"name": profile_name, "items": report_items}
+    if expert_init_table is not None:
+        report_section["tables"] = [expert_init_table]
     num_seen = len(heads)
     if is_profile_flops_enabled():
         if task_router_inference == "top1":
@@ -2580,23 +2997,27 @@ def _run_incremental_vae_router_profile(
 
     return {
         "results": results,
-        "report_section": {"name": profile_name, "items": report_items},
+        "report_section": report_section,
         "extra_report_sections": extra_report_sections,
         "efficiency": efficiency,
         "run_dir": run_dir,
     }
 
 
-def run_incremental_2(root_run_dir, datasets, *, seed: int = 42, multi_seed: bool = False):
+def run_incremental_3(root_run_dir, datasets, *, seed: int = 42, multi_seed: bool = False):
     return _run_incremental_vae_router_profile(
         root_run_dir,
         datasets,
         seed=seed,
         multi_seed=multi_seed,
-        profile=INCREMENTAL_2,
+        profile=INCREMENTAL_3,
         profile_name="HiDMoA",
         profile_dir="HiDMoA",
     )
+
+
+def run_incremental_2(root_run_dir, datasets, *, seed: int = 42, multi_seed: bool = False):
+    return run_incremental_3(root_run_dir, datasets, seed=seed, multi_seed=multi_seed)
 
 
 def _bootstrap_reproducibility(base_seed: int) -> None:
@@ -2646,7 +3067,7 @@ def main():
     efficiency_order: List[str] = []
     datasets = None
 
-    needs_internal = run_mode == "incremental_2"
+    needs_internal = run_mode == "incremental_3"
     if needs_internal:
         datasets = prepare_data()
 
@@ -2655,8 +3076,8 @@ def main():
         set_seed(int(seed))
         print(f"[experiment] seed={seed} ({seeds.index(seed) + 1}/{len(seeds)})")
 
-        if run_mode == "incremental_2":
-            incr2 = run_incremental_2(root_run_dir, datasets, seed=seed, multi_seed=multi_seed)
+        if run_mode == "incremental_3":
+            incr2 = run_incremental_3(root_run_dir, datasets, seed=seed, multi_seed=multi_seed)
             _record_section_run(
                 sections_by_name, section_order, incr2["report_section"], seed, run_dir=incr2.get("run_dir")
             )
@@ -2674,7 +3095,7 @@ def main():
             )
 
     if not section_order:
-        supported_modes = ["incremental_2"]
+        supported_modes = ["incremental_3"]
         raise ValueError(
             f"RUN_MODE '{RUN_MODE}' (normalized='{run_mode}') did not match any runnable profile. "
             f"Supported values: {supported_modes}"
