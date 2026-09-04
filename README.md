@@ -1,15 +1,15 @@
 # HiDMoA
 
 HiDMoA is a class-incremental defect classification method based on task-wise MoE
-adapters, prototype heads, and a feature-VAE task router.
+adapters, prototype heads, a feature-VAE task router, and incre3 expert-transfer
+initialization.
 
-This repository contains the extracted HiDMoA method only. Experiment output
+This repository contains the extracted HiDMoA incre3 method only. Experiment output
 folders, ablation launchers, and unrelated baseline repositories are not required
 for normal use.
 
-The public method name is `HiDMoA`. In the original research code the same method
-was named `incremental_2`; the config key is still `INCREMENTAL_2` for backward
-compatibility.
+The public method name is `HiDMoA`. In the original research code this exported
+variant is named `incremental_3` / `incre3`; the config key is `INCREMENTAL_3`.
 
 ## 1. What to run first
 
@@ -31,13 +31,13 @@ If this is a fresh machine, create and activate `mmlab` before `pip install -e .
 - Label files with non-numeric class names are also supported.
 - Filename prefix fallback is supported when label files are unavailable.
 
-## 3. Reproducing incremental_2 (HiDMoA)
+## 3. Reproducing incre3 (HiDMoA)
 
 ```bash
 hidmoa --dataset neu_xsdd --seed 42 --repeats 1 --device cuda
 ```
 
-`hidmoa` maps to incremental_2 by default.
+`hidmoa` maps to incremental_3 by default.
 
 Or use the script entry directly (equivalent after installation and in the same
 environment):
@@ -60,7 +60,7 @@ use `python ...` when you only want to run the module directly.
   6*. `model.backbone`
   7*. `model.experts_per_task`
 
-- All `INCREMENTAL_2` knobs are in `src/hidmoa/config.py` (`model.*`, `train.*`, `vae/router` fields); full prioritized list is in `Important Hyperparameters`.
+- All `INCREMENTAL_3` knobs are in `src/hidmoa/config.py` (`model.*`, `train.*`, `vae/router`, and `expert_init` fields); full prioritized list is in `Important Hyperparameters`.
 - For quick smoke tests, use `--quick-test`.
 
 ## Repository Layout
@@ -423,7 +423,7 @@ For `--repeats 1`, read `test.txt`. For `--repeats > 1`, read
 
 ## Important Hyperparameters
 
-Most method hyperparameters are in `INCREMENTAL_2` inside `src/hidmoa/config.py`.
+Most method hyperparameters are in `INCREMENTAL_3` inside `src/hidmoa/config.py`.
 The most commonly changed settings are:
 
 ```text
@@ -432,6 +432,7 @@ CIL_ACTIVE_DATASET*                  dataset/task preset name
 CIL_SEED*                           base seed
 CIL_REPEATS*                        number of repeated seeds
 HIDMOA_DEVICE                       cuda or cpu
+DATA.image_size*                     global image resize used by training/eval loaders
 HIDMOA_BATCH_SIZE*                  model training batch size
 CIL_NUM_WORKERS                      DataLoader workers; default 0 for portability
 HIDMOA_EPOCHS_PER_TASK*             epochs for each incremental session
@@ -442,6 +443,7 @@ HIDMOA_FVAE_BATCH_SIZE              feature-VAE batch size
 HIDMOA_FVAE_GENERATED_PER_CLASS*    generated/replayed feature count per class
 HIDMOA_FVAE_FEATURE_BATCH           feature extraction batch size
 HIDMOA_ROUTER_IMPORTANCE_SAMPLES*   router scoring sample count
+HIDMOA_EXPERT_INIT_STRATEGY*        incre3 expert initialization strategy
 CIL_PROFILE_FLOPS                   1 to profile FLOPs, 0 to skip
 train.taskid_image_size*             task-router / task-id branch input size
 train.vae_router_backbone_image_size* router feature-extractor input size
@@ -452,13 +454,15 @@ train.fvae.h_dim*                   feature-VAE hidden dimension
 train.fvae.z_dim*                   feature-VAE latent dimension
 ```
 
-Key config fields in `INCREMENTAL_2`:
+Key config fields in `INCREMENTAL_3`:
 
 ```text
-model.backbone*                      resnet18, resnet50, resnet101, etc.
+model.backbone*                      deit_small_patch16_224_in661 by default
 model.pretrained                     use ImageNet-pretrained backbone weights
 model.moe_layers                     backbone stages with MoE adapters
 model.experts_per_task*              experts added per task
+train.expert_init_strategy*          new_copyold1 by default
+train.expert_similarity_source       train_eval by default
 train.lr*                           classifier/adapter learning rate
 train.weight_decay*                 classifier/adapter weight decay
 train.head_type*                    cosine_prototype, prototype, linear, cos
@@ -473,6 +477,20 @@ train.fvae.h_dim*                   feature-VAE hidden dimension
 train.fvae.z_dim*                   feature-VAE latent dimension
 train.fvae.beta_kl*                 KL loss weight
 ```
+
+The default incre3 expert strategy is `new_copyold1`: for every task after the
+first, the method ranks old tasks by fVAE reconstruction score on current-task
+features, ranks experts inside the selected old task by gate usage, and copies
+the top expert into the new task. Other built-in strategies include
+`new_random`, `new_random2`, `new_random_copyold1`, `new_random_copyold2`, and
+`new_random_reuse_old1`.
+
+The default backbone is `deit_small_patch16_224_in661`. This repository does not
+bundle the external TPL source tree used by that backbone implementation. Set
+`CIL_TPL_REPO_DIR` to the directory containing `networks/vit_hat.py`, and set
+`CIL_MORE_PRETRAINED_PATH` or `CIL_TPL_PRETRAINED_DIR` for the pretrained
+checkpoint. To avoid the DeiT dependency, edit `INCREMENTAL_3["model"]` and
+`train.vae_router_backbone` to a bundled torchvision backbone such as `resnet18`.
 
 `train.class_internal_loss` is kept for ablation compatibility. In the default
 HiDMoA setting it is not enabled:
