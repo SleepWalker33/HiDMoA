@@ -1,4 +1,4 @@
-"""HiDMoA 配置（当前仅保留 incremental_2，默认 hidmoa 跑法）。"""
+"""HiDMoA 配置（当前仅保留 incre3 专家迁移版本）。"""
 
 import os
 from copy import deepcopy
@@ -295,10 +295,10 @@ def _common_backbone_model(backbone: str, *, pretrained: bool = True, scale: flo
 
 # ============================================================
 # 全局运行开关
-# 固定走 incremental_2（hidmoa）
+# 固定走 incremental_3（hidmoa）
 # ============================================================
 
-RUN_MODE = os.getenv("RUN_MODE", "incremental_2")
+RUN_MODE = os.getenv("RUN_MODE", "incremental_3")
 
 # 复现性：main.py 默认开启（CIL_DETERMINISTIC=1）。
 # 关闭严格确定性（更快、数值可能漂移）： export CIL_DETERMINISTIC=0
@@ -388,15 +388,15 @@ def _default_increment_step(task_splits):
 
 
 # ============================================================
-# 场景2：增量学习2（incremental_2，HiDMoA）
-# 仅保留当前方法与参数；其他场景已移除。
+# 场景3：增量学习3（HiDMoA / incre3）
+# 仅保留专家迁移版当前方法与参数；其他场景和外部方法已移除。
 # ============================================================
-INCREMENTAL_2 = {
+INCREMENTAL_3 = {
     "name": "HiDMoA",
     "model": _common_backbone_model(
-        "resnet18",  # default backbone
+        "deit_small_patch16_224_in661",
         pretrained=True,
-        experts_per_task=COMMON_BACKBONE_CONFIGS["resnet18"]["experts_per_task"],
+        experts_per_task=COMMON_BACKBONE_CONFIGS["deit_small_patch16_224_in661"]["experts_per_task"],
     ),
     "train": {
         "device": os.getenv("HIDMOA_DEVICE", "cuda" if torch.cuda.is_available() else "cpu"),
@@ -420,17 +420,59 @@ INCREMENTAL_2 = {
         "task_router_inference": "top1",
         "task_router_alpha": 0.4,
         "task_router_class_score_mode": "raw",
+        # Expert-transfer initialization used by the incre3 variant.
+        # new_random | new_random2 | new_copyold1 | new_random_copyold1 | new_random_copyold2 | new_random_reuse_old1
+        "expert_init_strategy": os.getenv("HIDMOA_EXPERT_INIT_STRATEGY", "new_copyold1"),
+        "expert_similarity_metric": "fvae_recon",
+        "expert_similarity_source": "train_eval",
+        "expert_copy_top_k": 0,
+        "expert_reuse_top_k": 0,
+        "expert_reuse_trainable": False,
+        "expert_init_strategy_presets": {
+            "new_random": {
+                "include_random_experts": True,
+                "copy_top_k": 0,
+                "reuse_top_k": 0,
+            },
+            "new_random2": {
+                "include_random_experts": True,
+                "random_expert_multiplier": 2,
+                "copy_top_k": 0,
+                "reuse_top_k": 0,
+            },
+            "new_copyold1": {
+                "include_random_experts": False,
+                "copy_top_k": 1,
+                "reuse_top_k": 0,
+            },
+            "new_random_copyold1": {
+                "include_random_experts": True,
+                "copy_top_k": 1,
+                "reuse_top_k": 0,
+            },
+            "new_random_copyold2": {
+                "include_random_experts": True,
+                "copy_top_k": 2,
+                "reuse_top_k": 0,
+            },
+            "new_random_reuse_old1": {
+                "include_random_experts": True,
+                "copy_top_k": 0,
+                "reuse_top_k": 1,
+                "reuse_trainable": False,
+            },
+        },
         "vae_router_type": "fvae",
         "vae_router_grouping": "task",
         "vae_router_score_mode": "recon",  # IS | recon | elbo_k
-        "vae_router_backbone": "resnet18",
+        "vae_router_backbone": "deit_small_patch16_224_in661",
         "vae_router_backbone_pretrained": True,
         "vae_router_backbone_image_size": DATA.get("image_size", 224),
         "vae_router_use_feature_space": True,
         "fvae": {
             "h_dim": 512,
             "z_dim": 128,
-            "input_dim": DATA["feat_dim"] if "feat_dim" in DATA else 512,
+            "input_dim": COMMON_BACKBONE_CONFIGS["deit_small_patch16_224_in661"]["feat_dim"],
             "epochs": int(os.getenv("HIDMOA_FVAE_EPOCHS", "200")),
             "early_stopping_patience": int(os.getenv("HIDMOA_FVAE_PATIENCE", "20")),
             "early_stopping_min_delta": 1e-4,
@@ -512,7 +554,7 @@ INCREMENTAL_2 = {
 
 
 PROFILES = [
-    INCREMENTAL_2,
+    INCREMENTAL_3,
 ]
 ACTIVE_PROFILES = [p["name"] for p in PROFILES]
 
